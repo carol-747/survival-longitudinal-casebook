@@ -1,0 +1,211 @@
+---
+title: "Case 3: Marginal vs. conditional models for repeated binary outcomes"
+output:
+  github_document:
+    toc: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4.2, dpi = 150,
+                      fig.path = "figures/")
+library(geepack)
+library(lme4)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+theme_set(theme_minimal(base_size = 12))
+```
+
+## Question
+
+Children were assessed for wheeze once a year from age 7 to 10. **Is maternal smoking associated with a child's risk of wheeze, and does wheeze change with age?**
+
+Each child contributes four correlated binary outcomes, so a standard logistic regression would understate uncertainty. The two usual remedies, generalized estimating equations (GEE) and generalized linear mixed models (GLMM), answer different questions and give different numbers. This case fits both and explains why the coefficients differ.
+
+## Data
+
+`geepack::ohio`: a subset of the Harvard Six Cities Study of air pollution and health (Ware et al., 1984).
+
+```{r data}
+data(ohio, package = "geepack")
+ohio <- ohio |>
+  mutate(age_years = age + 9,                       # age is centred at 9 in the source data
+         smoke = factor(smoke, 0:1, c("Non-smoking mother", "Smoking mother")))
+
+c(children = n_distinct(ohio$id), observations = nrow(ohio),
+  smoking_mothers = sum(ohio$smoke == "Smoking mother") / 4)
+```
+
+Every child has all four visits, and maternal smoking was recorded once at baseline.
+
+```{r observed}
+obs <- ohio |>
+  group_by(age_years, smoke) |>
+  summarise(p = mean(resp), n = n(), .groups = "drop")
+
+ggplot(obs, aes(age_years, p, colour = smoke)) +
+  geom_line(linewidth = 0.8) + geom_point(size = 2) +
+  scale_colour_manual(values = c("#7f8c8d", "#c0392b")) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 0.25)) +
+  labs(x = "Age (years)", y = "Proportion with wheeze", colour = NULL) +
+  theme(legend.position = "bottom")
+```
+
+## Analysis plan
+
+| Step | Model | Interpretation |
+|---|---|---|
+| 1 | Logistic GLM ignoring clustering | Shows why model-based SEs are too small |
+| 2 | GEE with independence, exchangeable, AR(1) and unstructured working correlation | **Marginal** (population-averaged) odds ratios with robust SEs |
+| 3 | GLMM with a random intercept per child | **Conditional** (child-specific) odds ratios |
+| 4 | Compare GEE and GLMM coefficients and marginal probabilities | Explain the difference |
+
+Age is linear (centred at 9). An age × smoking interaction was tested first and dropped (GEE Wald p = `r sprintf("%.2f", coef(summary(geeglm(resp ~ age * smoke, id = id, data = ohio, family = binomial, corstr = "exchangeable")))["age:smokeSmoking mother", "Pr(>|W|)"])`), so the main-effects model is used throughout.
+
+## 1. Ignoring the clustering
+
+```{r naive}
+naive  <- glm(resp ~ age + smoke, data = ohio, family = binomial)
+gee_ind <- geeglm(resp ~ age + smoke, id = id, data = ohio, family = binomial,
+                  corstr = "independence")
+
+tibble(term = names(coef(naive)),
+       estimate = coef(naive),
+       `model-based SE` = sqrt(diag(vcov(naive))),
+       `robust (sandwich) SE` = sqrt(diag(vcov(gee_ind)))) |>
+  mutate(across(-term, \(x) round(x, 3))) |>
+  knitr::kable()
+```
+
+The point estimates are identical (GEE with an independence working correlation *is* logistic regression), but the robust SE for maternal smoking is larger. The naive SE treats 2,148 observations as independent when they come from 537 children, so it overstates precision for a child-level exposure such as smoking. The SE for age moves the other way: age varies *within* each child, and comparing a child with themselves removes between-child noise, so ignoring the clustering actually understates precision for age.
+
+## 2. GEE: population-averaged effects
+
+```{r gee}
+corstrs <- c("independence", "exchangeable", "ar1", "unstructured")
+gee_fits <- lapply(corstrs, \(cs)
+  geeglm(resp ~ age + smoke, id = id, data = ohio, family = binomial, corstr = cs))
+names(gee_fits) <- corstrs
+
+or_ci <- function(est, se) sprintf("%.2f (%.2f, %.2f)", exp(est), exp(est - 1.96 * se), exp(est + 1.96 * se))
+
+lapply(names(gee_fits), \(cs) {
+  s <- coef(summary(gee_fits[[cs]]))
+  tibble(`Working correlation` = cs,
+         `Age (per year)` = or_ci(s["age", "Estimate"], s["age", "Std.err"]),
+         `Smoking mother` = or_ci(s["smokeSmoking mother", "Estimate"], s["smokeSmoking mother", "Std.err"]))
+}) |>
+  bind_rows() |>
+  knitr::kable(caption = "GEE odds ratios (95% CI, robust SEs)")
+```
+
+```{r gee-alpha, include = FALSE}
+alpha_exch <- gee_fits$exchangeable$geese$alpha[[1]]
+```
+
+The estimates barely change across working correlation structures. That is expected: GEE estimates are consistent even if the working correlation is wrong, and the robust SE protects inference. A better-chosen structure mainly improves efficiency. The exchangeable model estimates a within-child correlation of `r sprintf("%.2f", alpha_exch)`; the unstructured estimates (0.30–0.47) are similar enough that exchangeable is a reasonable summary.
+
+## 3. GLMM: child-specific effects
+
+```{r glmm}
+glmm <- glmer(resp ~ age + smoke + (1 | id), data = ohio, family = binomial, nAGQ = 25)
+sigma_b <- attr(VarCorr(glmm)$id, "stddev")[[1]]
+
+s <- summary(glmm)$coefficients
+tibble(term = c("Age (per year)", "Smoking mother"),
+       OR = c(or_ci(s["age", 1], s["age", 2]),
+              or_ci(s["smokeSmoking mother", 1], s["smokeSmoking mother", 2]))) |>
+  knitr::kable(caption = "GLMM conditional odds ratios (95% CI)")
+```
+
+The random-intercept SD is `r sprintf("%.2f", sigma_b)` on the log-odds scale: children differ greatly in their underlying tendency to wheeze. Adaptive Gauss–Hermite quadrature with 25 points is used because the Laplace approximation can be biased for binary outcomes with large random-effect variance.
+
+## 4. Why the two models disagree
+
+```{r compare}
+gee_ex <- gee_fits$exchangeable
+cmp <- tibble(
+  term = c("Age (per year)", "Smoking mother"),
+  `GEE log-OR (marginal)`   = coef(gee_ex)[c("age", "smokeSmoking mother")],
+  `GLMM log-OR (conditional)` = fixef(glmm)[c("age", "smokeSmoking mother")]
+) |>
+  mutate(Ratio = `GLMM log-OR (conditional)` / `GEE log-OR (marginal)`)
+
+attenuation <- sqrt(1 + (16 * sqrt(3) / (15 * pi))^2 * sigma_b^2)
+knitr::kable(cmp, digits = 3)
+```
+
+The GLMM coefficients are about `r sprintf("%.1f", mean(cmp$Ratio))` times the GEE coefficients. This is not a contradiction; the models estimate different quantities:
+
+- **GEE (marginal):** how the *proportion* of children with wheeze differs between the population of children with smoking mothers and the population without. This is the natural target for public-health questions.
+- **GLMM (conditional):** how the odds change for a *given child*, holding that child's random effect fixed. Because the logit link is non-linear, averaging child-specific curves over a heterogeneous population flattens them, so marginal effects are smaller.
+
+For a random-intercept logistic model, the approximate relationship is β<sub>marginal</sub> ≈ β<sub>conditional</sub> / √(1 + c²σ²) with c = 16√3 / (15π) (Zeger, Liang & Albert, 1988). With σ = `r sprintf("%.2f", sigma_b)` this predicts a ratio of `r sprintf("%.2f", attenuation)`, close to what we observe.
+
+### Marginalizing the GLMM
+
+Averaging the GLMM's child-specific probabilities over the estimated random-effect distribution recovers population-level probabilities that line up with the GEE fit and the observed data:
+
+```{r marginalize}
+gh <- function(n) {                 # Gauss–Hermite nodes and weights (Golub–Welsch)
+  i <- seq_len(n - 1)
+  J <- matrix(0, n, n); J[cbind(i, i + 1)] <- J[cbind(i + 1, i)] <- sqrt(i / 2)
+  e <- eigen(J, symmetric = TRUE)
+  list(x = e$values, w = sqrt(pi) * e$vectors[1, ]^2)
+}
+nodes <- gh(40)
+
+grid <- expand_grid(age = -2:1, smoke = levels(ohio$smoke)) |>
+  mutate(age_years = age + 9)
+X <- model.matrix(~ age + smoke, grid)
+
+eta <- drop(X %*% fixef(glmm))
+grid$`GLMM, marginalized` <- sapply(eta, \(e)
+  sum(nodes$w * plogis(e + sqrt(2) * sigma_b * nodes$x)) / sqrt(pi))
+grid$`GLMM, typical child (b = 0)` <- plogis(eta)
+grid$GEE <- plogis(drop(X %*% coef(gee_ex)))
+
+grid |>
+  pivot_longer(c(GEE, `GLMM, marginalized`, `GLMM, typical child (b = 0)`),
+               names_to = "model", values_to = "p") |>
+  ggplot(aes(age_years, p, colour = model, linetype = model)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(data = obs, aes(age_years, p), inherit.aes = FALSE, colour = "black", size = 1.8) +
+  facet_wrap(~ smoke) +
+  scale_colour_manual(values = c("#1b6ca8", "#c0392b", "#e67e22")) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 0.25)) +
+  labs(x = "Age (years)", y = "Probability of wheeze", colour = NULL, linetype = NULL,
+       caption = "Points: observed proportions") +
+  theme(legend.position = "bottom", legend.direction = "vertical")
+```
+
+The "typical child" curve (random effect = 0) sits far below the observed proportions: the median child rarely wheezes, while a minority of children wheeze often. Integrating over that heterogeneity brings the GLMM back in line with the GEE and the data.
+
+## Conclusions
+
+```{r conclusion-numbers, include = FALSE}
+ge <- coef(summary(gee_ex))
+or_age   <- exp(ge["age", "Estimate"])
+or_smoke <- exp(ge["smokeSmoking mother", "Estimate"]); p_smoke <- ge["smokeSmoking mother", "Pr(>|W|)"]
+```
+
+- Wheeze declined with age: in the population-averaged model, the odds fell by about `r round(100 * (1 - or_age))`% per year (OR `r sprintf("%.2f", or_age)`).
+- Children of smoking mothers had higher odds of wheeze (marginal OR `r sprintf("%.2f", or_smoke)`), but the evidence is weak (p = `r sprintf("%.2f", p_smoke)`) and the CI includes no effect.
+- For a population-level question ("how much more common is wheeze among children of smokers?") the GEE odds ratio is the right summary. The GLMM is the right tool for child-level questions and for modelling between-child heterogeneity, but its larger coefficients should not be reported as if they were population effects.
+
+## Limitations
+
+- Smoking is measured once at baseline and may have changed during follow-up.
+- No adjustment for other household exposures or socioeconomic status, which are not available in this subset.
+- Only four time points; a linear age trend is a simplification.
+
+## References
+
+- Ware JH, et al. Passive smoking, gas cooking, and respiratory health of children living in six cities. *Am Rev Respir Dis* 1984;129:366–74.
+- Zeger SL, Liang KY, Albert PS. Models for longitudinal data: a generalized estimating equation approach. *Biometrics* 1988;44:1049–60.
+- Fitzmaurice GM, Laird NM, Ware JH. *Applied Longitudinal Analysis*, 2nd ed. Wiley, 2011.
+
+```{r session, echo = FALSE}
+sessionInfo()$R.version$version.string
+```
